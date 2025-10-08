@@ -28,6 +28,18 @@ interface IUsycHelper {
     function sellFor(uint256 amount, address recipient) external returns (uint256);
 
     /**
+     * @notice Preview a sale of Yield Token
+     * @dev Produces the anticipated payout and fees using a price.
+     *      Total amount of yield token is rounded down to 2 decimals (cents)
+     *      sending more precision will not be used in payout calculation
+     * @param amount is the amount of Yield Token to sell
+     * @return payout amount of stablecoin received
+     * @return fee taken
+     * @return price used in conversion
+     */
+    function sellPreview(uint256 amount) external view returns (uint256 payout, uint256 fee, int256 price);
+
+    /**
      * @notice Check if selling is currently paused
      * @return true if selling is paused, false otherwise
      */
@@ -61,8 +73,9 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
     address public helper;
     address public caller;
     address public usycTreasury;
-    uint256 public feeMultiplier;
-    address public usdcTreasury;
+    uint256 public RESERVE1;
+    address public RESERVE2;
+    uint256 public maxSellFeeRate;
 
     uint256 public constant FEE_MULTIPLIER = 10 ** 18;
     uint256 public constant HUNDRED_PCT = 100 * FEE_MULTIPLIER;
@@ -85,9 +98,7 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
         address _usdc,
         address _helper,
         address _caller,
-        address _usycTreasury,
-        address _usdcTreasury,
-        uint256 _feeMultiplier
+        address _usycTreasury
     ) public initializer {
         if (_usyc == address(0)) revert ZeroAddress();
         if (_usdc == address(0)) revert ZeroAddress();
@@ -103,8 +114,6 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
         helper = _helper;
         caller = _caller;
         usycTreasury = _usycTreasury;
-        usdcTreasury = _usdcTreasury;
-        feeMultiplier = _feeMultiplier;
 
         // Get decimals from both tokens
         usycDecimals = IERC20MetadataUpgradeable(_usyc).decimals();
@@ -115,47 +124,34 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
     }
 
     /**
+     * @notice Set the maximum sell fee rate (only owner)
+     * @param _maxRate Maximum sell fee rate
+     */
+    function setMaxSellFeeRate(uint256 _maxRate) external onlyOwner {
+        maxSellFeeRate = _maxRate;
+    }
+
+    /**
      * @notice Redeem USYC tokens for USDC using USYC's sell function
      * @param _amount Amount of USDC desired to receive
-     * @return received usdc amount
+     * @return payout usdc amount
+     * @return fee charged by usdc amount
+     * @return price used in conversion
      */
-    function redeem(uint256 _amount) external override returns (uint256) {
+    function redeem(uint256 _amount) external override returns (uint256 payout, uint256 fee, int256 price) {
         if (msg.sender != caller) revert UnauthorizedCaller();
-        if (_amount == 0) return 0;
 
         uint256 sellFeeRate = IUsycHelper(helper).sellFee();
+        if (sellFeeRate > maxSellFeeRate) revert ExcessiveSellFee(sellFeeRate);
 
-        // Prevent division by zero - if fee is 100% or more, redemption is impossible
-        if (sellFeeRate >= HUNDRED_PCT) revert ExcessiveSellFee(sellFeeRate);
-
-        // Calculate the gross USDC payout needed to receive _amount after fees
-        // netPayout = grossPayout * (1 - sellFeeRate / HUNDRED_PCT)
-        // So: grossPayout = netPayout / (1 - sellFeeRate / HUNDRED_PCT)
-        uint256 grossUsdc = _amount.mulDiv(
-            HUNDRED_PCT,
-            HUNDRED_PCT - feeMultiplier * sellFeeRate,
-            MathUpgradeable.Rounding.Up
-        );
-
-        // Convert the gross USDC amount to USYC tokens with rounding up
-        uint256 usycAmount = convertUsdcToToken(grossUsdc);
+        uint256 usycAmount = convertUsdcToToken(_amount);
 
         SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(usyc), usycTreasury, address(this), usycAmount);
         SafeERC20Upgradeable.safeIncreaseAllowance(IERC20Upgradeable(usyc), helper, usycAmount);
 
-        uint256 usdcReceived = IUsycHelper(helper).sellFor(usycAmount, address(this));
-        if (usdcReceived < _amount) revert InsufficientUSDCReceived(usdcReceived, _amount);
+        IUsycHelper(helper).sellFor(usycAmount, address(caller));
 
-        // Transfer only the requested amount to caller
-        SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(usdc), caller, _amount);
-
-        // Return any excess to treasury
-        uint256 excess = usdcReceived - _amount;
-        if (excess > 0) {
-            SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(usdc), usdcTreasury, excess);
-        }
-
-        return _amount; // Always return exactly what was requested
+        (payout, fee, price) = IUsycHelper(helper).sellPreview(usycAmount);
     }
 
     /**
@@ -259,22 +255,6 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         SafeERC20Upgradeable.safeTransfer(IERC20Upgradeable(token), owner(), amount);
-    }
-
-    /**
-     * @notice Set the fee multiplier (only owner)
-     * @param _feeMultiplier New fee multiplier value
-     */
-    function setFeeMultiplier(uint256 _feeMultiplier) external onlyOwner {
-        feeMultiplier = _feeMultiplier;
-    }
-
-    /**
-     * @notice Set the USDC treasury address (only owner), the excess USDC will be sent to this address
-     * @param _usdcTreasury Address of the USDC treasury
-     */
-    function setUsdcReceiver(address _usdcTreasury) external onlyOwner {
-        usdcTreasury = _usdcTreasury;
     }
 
     /**

@@ -6,5 +6,5 @@ interface IRedemption {
 
     function checkPaused() external view returns (bool);
 
-    function redeem(uint256 amount) external returns (uint256);
+    function redeem(uint256 amount) external returns (uint256 payout, uint256 fee, int256 price);
 }

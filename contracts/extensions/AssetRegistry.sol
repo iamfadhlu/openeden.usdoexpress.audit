@@ -28,7 +28,6 @@ contract AssetRegistry is IAssetRegistry, UUPSUpgradeable, AccessControlUpgradea
 
     // Constants
     uint256 private constant _USDO_DECIMALS = 18;
-    uint256 private constant _DECIMALS_6 = 1e6;
 
     // Maximum staleness period for price feeds (default: 2 days)
     uint256 public maxStalePeriod;

@@ -17,7 +17,8 @@ import "../interfaces/IAssetRegistry.sol";
 
 enum TxType {
     MINT,
-    REDEEM
+    REDEEM,
+    INSTANT_REDEEM
 }
 
 contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpressPausable, USDOMintRedeemLimiter {
@@ -35,14 +36,13 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
     // APY in base points, scaled by 1e4 (e.g., 100 = 1%)
     uint256 public _apy; // 500 => 5%
 
-    // Fee rates, scaled by 1e4, e.g., 1 = 0.01%
+    // fee rate for mint, scaled by 1e4, e.g., 100 stands for 1%
     uint256 public _mintFeeRate;
     uint256 public _redeemFeeRate;
 
     // constants for base points and scaling
     uint256 private constant _BPS_BASE = 1e4;
     uint256 private constant _BASE = 1e18;
-    uint256 private constant _DECIMALS = 1e6;
 
     // daily bonus multiplier increment, scaled by 1e18
     uint256 public _increment;
@@ -86,11 +86,15 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
     // Track redemption amounts for users in the queue
     mapping(address => uint256) private _redemptionInfo;
 
+    // fee rate for instant redeem, scaled by 1e4, e.g., 100 stands for 1%
+    uint256 public _instantRedeemFeeRate;
+
     // Events
     event UpdateAPY(uint256 apy, uint256 increment);
     event UpdateCusdo(address cusdo);
     event UpdateMintFeeRate(uint256 fee);
     event UpdateRedeemFeeRate(uint256 fee);
+    event UpdateInstantRedeemFee(uint256 fee);
     event UpdateTreasury(address treasury);
     event UpdateFeeTo(address feeTo);
     event UpdateTimeBuffer(uint256 timeBuffer);
@@ -114,7 +118,16 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
     event USDOKycGranted(address[] addresses);
     event USDOKycRevoked(address[] addresses);
 
-    event InstantRedeem(address indexed from, address indexed to, uint256 reqAmt, uint256 receiveAmt, uint256 fee);
+    event InstantRedeem(
+        address indexed from,
+        address indexed to,
+        uint256 reqAmt,
+        uint256 receiveAmt,
+        uint256 fee,
+        uint256 payout,
+        uint256 usycFee,
+        int256 price
+    );
     event ManualRedeem(address indexed from, uint256 reqAmt, uint256 receiveAmt, uint256 fee);
     event UpdateFirstDeposit(address indexed account, bool flag);
 
@@ -271,13 +284,23 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
     }
 
     /**
-     * @notice Updates the fee percentage.
+     * @notice Updates the fee percentage for redeem.
      * @dev This function can only be called by the operator.
      * @param fee The new fee percentage in base points.
      */
     function updateRedeemFee(uint256 fee) external onlyRole(MAINTAINER_ROLE) {
         _redeemFeeRate = fee;
         emit UpdateRedeemFeeRate(fee);
+    }
+
+    /**
+     * @notice Updates the fee percentage for instant redeem.
+     * @dev This function can only be called by the operator.
+     * @param fee The new fee percentage in base points.
+     */
+    function updateInstantRedeemFee(uint256 fee) external onlyRole(MAINTAINER_ROLE) {
+        _instantRedeemFeeRate = fee;
+        emit UpdateInstantRedeemFee(fee);
     }
 
     /**
@@ -331,17 +354,15 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
         uint256 usdcNeeded = convertToUnderlying(_usdc, amt);
 
         // 3. redeem through the redemption contract (handles fees and rounding internally)
-        uint256 usdcReceived = _redemptionContract.redeem(usdcNeeded);
-
-        if (usdcReceived != usdcNeeded) revert USDOExpressReceiveUSDCFailed(usdcNeeded, usdcReceived);
+        (uint256 payout, uint256 usycFee, int256 price) = _redemptionContract.redeem(usdcNeeded);
 
         // 4. calculate fees
-        uint256 feeInUsdc = txsFee(usdcNeeded, TxType.REDEEM);
-        uint256 usdcToUser = usdcNeeded - feeInUsdc;
+        uint256 feeInUsdc = txsFee(usdcNeeded, TxType.INSTANT_REDEEM);
+        uint256 usdcToUser = payout - feeInUsdc;
 
         // 5. transfer USDC fee to feeTo and the rest to user
         _distributeUsdc(to, usdcToUser, feeInUsdc);
-        emit InstantRedeem(from, to, amt, usdcToUser, feeInUsdc);
+        emit InstantRedeem(from, to, amt, usdcToUser, feeInUsdc, payout, usycFee, price);
     }
 
     /**
@@ -375,7 +396,7 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
         if (!_kycList[from]) revert USDOExpressNotInKycList(from, from);
         _usdo.burn(from, amt);
 
-        (uint256 feeAmt, uint256 usdcAmt) = previewRedeem(amt);
+        (uint256 feeAmt, uint256 usdcAmt) = previewRedeem(amt, false);
         emit ManualRedeem(from, amt, usdcAmt, feeAmt);
     }
 
@@ -494,7 +515,14 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
     }
 
     function txsFee(uint256 amt, TxType txType) public view returns (uint256 fee) {
-        uint256 feeRate = txType == TxType.MINT ? _mintFeeRate : _redeemFeeRate;
+        uint256 feeRate;
+        if (txType == TxType.MINT) {
+            feeRate = _mintFeeRate;
+        } else if (txType == TxType.REDEEM) {
+            feeRate = _redeemFeeRate;
+        } else if (txType == TxType.INSTANT_REDEEM) {
+            feeRate = _instantRedeemFeeRate;
+        }
         fee = (amt * feeRate) / _BPS_BASE;
     }
 
@@ -525,8 +553,9 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
         (usdoAmtCurr, usdoAmtNext) = previewIssuance(usdoAmt);
     }
 
-    function previewRedeem(uint256 amt) public view returns (uint256 feeAmt, uint256 usdcAmt) {
-        uint256 feeInUsdo = txsFee(amt, TxType.REDEEM);
+    function previewRedeem(uint256 amt, bool isInstant) public view returns (uint256 feeAmt, uint256 usdcAmt) {
+        TxType txType = isInstant ? TxType.INSTANT_REDEEM : TxType.REDEEM;
+        uint256 feeInUsdo = txsFee(amt, txType);
         feeAmt = convertToUnderlying(_usdc, feeInUsdo);
         usdcAmt = convertToUnderlying(_usdc, amt - feeInUsdo);
     }

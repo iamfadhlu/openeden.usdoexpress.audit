@@ -10,8 +10,8 @@ import {
   MockCUSDO,
   MockTBILL,
   MockUSDC,
+  MockSimpleRedemption,
   USDO,
-  USDOExpress,
   USDOExpressV2,
   AssetRegistry,
 } from '../typechain-types';
@@ -51,6 +51,7 @@ describe('USDOExpress', function () {
   let tbill: MockTBILL;
   let buidl: MockBUIDL;
   let buidlRedemption: MockBuidlRedemption;
+  let simpleRedemption: MockSimpleRedemption;
   let assetRegistry: AssetRegistry;
   let owner: SignerWithAddress;
   let operator: SignerWithAddress;
@@ -98,6 +99,11 @@ describe('USDOExpress', function () {
     const MockBuidlRedemption = await ethers.getContractFactory('MockBuidlRedemption');
     buidlRedemption = await MockBuidlRedemption.deploy(buidl.address, usdc.address);
     await buidlRedemption.deployed();
+
+    // Deploy simple redemption contract for USDOExpressV2
+    const MockSimpleRedemption = await ethers.getContractFactory('MockSimpleRedemption');
+    simpleRedemption = await MockSimpleRedemption.deploy(usdc.address);
+    await simpleRedemption.deployed();
 
     // Deploy MockCUSDO
     const MockCUSDO = await ethers.getContractFactory('MockCUSDO');
@@ -171,7 +177,7 @@ describe('USDOExpress', function () {
     await usdoExpress.connect(maintainer).setAssetRegistry(assetRegistry.address);
 
     // Set Redemption contract (this replaces the old _buidlRedemption storage slot)
-    await usdoExpress.connect(maintainer).setRedemption(buidlRedemption.address);
+    await usdoExpress.connect(maintainer).setRedemption(simpleRedemption.address);
 
     // Update cUSDO address (this replaces the old _buidlTreasury storage slot)
     await usdoExpress.connect(maintainer).updateCusdo(cusdo.address);
@@ -204,7 +210,7 @@ describe('USDOExpress', function () {
     console.log('usdoExpress settings updated');
 
     // Set up redemption contract
-    await usdoExpress.connect(maintainer).setRedemption(buidlRedemption.address);
+    await usdoExpress.connect(maintainer).setRedemption(simpleRedemption.address);
     console.log('Redemption contract set up');
 
     // Configure supported assets in AssetRegistry
@@ -225,6 +231,40 @@ describe('USDOExpress', function () {
 
   beforeEach(async function () {
     await loadFixture(deployusdoExpressFixture);
+  });
+
+  describe('Fee Management', function () {
+    it('should update instant redeem fee and emit event', async function () {
+      const newInstantRedeemFee = 50; // 0.5%
+
+      await expect(usdoExpress.connect(maintainer).updateInstantRedeemFee(newInstantRedeemFee))
+        .to.emit(usdoExpress, 'UpdateInstantRedeemFee')
+        .withArgs(newInstantRedeemFee);
+      expect(await usdoExpress._instantRedeemFeeRate()).to.equal(newInstantRedeemFee);
+    });
+
+    it('should test txsFee function with all three transaction types', async function () {
+      const testAmount = ethers.utils.parseUnits('1000', 18);
+      const mintFeeRate = 10; // 0.1%
+      const redeemFeeRate = 20; // 0.2%
+      const instantRedeemFeeRate = 30; // 0.3%
+
+      await usdoExpress.connect(maintainer).updateMintFee(mintFeeRate);
+      await usdoExpress.connect(maintainer).updateRedeemFee(redeemFeeRate);
+      await usdoExpress.connect(maintainer).updateInstantRedeemFee(instantRedeemFeeRate);
+
+      // Test MINT fee
+      const mintFee = await usdoExpress.txsFee(testAmount, 0); // 0 = MINT
+      expect(mintFee).to.equal(testAmount.mul(mintFeeRate).div(1e4));
+
+      // Test REDEEM fee
+      const redeemFee = await usdoExpress.txsFee(testAmount, 1); // 1 = REDEEM
+      expect(redeemFee).to.equal(testAmount.mul(redeemFeeRate).div(1e4));
+
+      // Test INSTANT_REDEEM fee
+      const instantRedeemFee = await usdoExpress.txsFee(testAmount, 2); // 2 = INSTANT_REDEEM
+      expect(instantRedeemFee).to.equal(testAmount.mul(instantRedeemFeeRate).div(1e4));
+    });
   });
 
   describe('Update APY', function () {
@@ -333,17 +373,59 @@ describe('USDOExpress', function () {
       console.log('Preview Mint with TBILL:', res);
       expect(res.netAmt).to.equal(mintAmount);
     });
+
+    it('should preview instant redeem correctly with instant redeem fee', async function () {
+      const instantRedeemFeeRate = 30; // 0.3%
+      const redeemAmount = ethers.utils.parseUnits('1000', 18); // 1000 USDO
+
+      await usdoExpress.connect(maintainer).updateInstantRedeemFee(instantRedeemFeeRate);
+
+      const { feeAmt, usdcAmt } = await usdoExpress.previewRedeem(redeemAmount, true);
+
+      // Calculate expected fee in USDO (30 basis points)
+      const expectedFeeInUsdo = redeemAmount.mul(instantRedeemFeeRate).div(1e4);
+      const expectedFeeInUsdc = await usdoExpress.convertToUnderlying(usdc.address, expectedFeeInUsdo);
+      const expectedUsdcToUser = await usdoExpress.convertToUnderlying(
+        usdc.address,
+        redeemAmount.sub(expectedFeeInUsdo),
+      );
+
+      expect(feeAmt).to.equal(expectedFeeInUsdc);
+      expect(usdcAmt).to.equal(expectedUsdcToUser);
+    });
+
+    it('should preview regular redeem correctly with regular redeem fee', async function () {
+      const redeemFeeRate = 20; // 0.2%
+      const redeemAmount = ethers.utils.parseUnits('1000', 18); // 1000 USDO
+
+      await usdoExpress.connect(maintainer).updateRedeemFee(redeemFeeRate);
+
+      const { feeAmt, usdcAmt } = await usdoExpress.previewRedeem(redeemAmount, false);
+
+      // Calculate expected fee in USDO (20 basis points)
+      const expectedFeeInUsdo = redeemAmount.mul(redeemFeeRate).div(1e4);
+      const expectedFeeInUsdc = await usdoExpress.convertToUnderlying(usdc.address, expectedFeeInUsdo);
+      const expectedUsdcToUser = await usdoExpress.convertToUnderlying(
+        usdc.address,
+        redeemAmount.sub(expectedFeeInUsdo),
+      );
+
+      expect(feeAmt).to.equal(expectedFeeInUsdc);
+      expect(usdcAmt).to.equal(expectedUsdcToUser);
+    });
   });
 
   describe('Instant Mint/Redeem', function () {
     const mintFeeRate = 10; // 0.1%
     const redeemFeeRate = 20; // 0.2%
+    const instantRedeemFeeRate = 30; // 0.3%
     const mintAmount = ethers.utils.parseUnits('1000', 6); // 1000 USDC or tbill
     const redeemAmount = ethers.utils.parseUnits('500', 18); // 500 USDO
 
     this.beforeEach(async function () {
       await usdoExpress.connect(maintainer).updateMintFee(mintFeeRate);
       await usdoExpress.connect(maintainer).updateRedeemFee(redeemFeeRate);
+      await usdoExpress.connect(maintainer).updateInstantRedeemFee(instantRedeemFeeRate);
       await usdc.transfer(whitelistedUser.address, mintAmount);
       await usdc.connect(whitelistedUser).approve(usdoExpress.address, mintAmount);
       console.log('USDC balance:', (await usdc.balanceOf(whitelistedUser.address)).toString());
@@ -407,6 +489,74 @@ describe('USDOExpress', function () {
       console.log('Preview USDO Issue:', res);
       expect(res.usdoAmtCurr).to.equal(usdoAmtCurr);
       expect(res.usdoAmtNext).to.equal(usdoAmtNext);
+    });
+
+    it('should allow instant redeem for whitelisted user', async function () {
+      // Mint USDO for the user
+      await usdo.mint(whitelistedUser.address, redeemAmount);
+
+      // Add USDC to the contract for redemption (this is what the user will receive)
+      const usdcNeeded = await usdoExpress.convertToUnderlying(usdc.address, redeemAmount);
+      await usdc.transfer(usdoExpress.address, usdcNeeded);
+
+      const initialUserUsdcBalance = await usdc.balanceOf(whitelistedUser.address);
+      const initialFeeToBalance = await usdc.balanceOf(feeTo.address);
+
+      // Perform instant redeem
+      await expect(usdoExpress.connect(whitelistedUser).instantRedeemSelf(whitelistedUser.address, redeemAmount))
+        .to.emit(usdoExpress, 'InstantRedeem')
+        .withArgs(
+          whitelistedUser.address,
+          whitelistedUser.address,
+          redeemAmount,
+          anyValue, // usdcToUser
+          anyValue, // feeInUsdc
+          anyValue, // payout
+          anyValue, // usycFee
+          anyValue, // price
+        );
+
+      // Check that user received USDC (minus fee)
+      const finalUserUsdcBalance = await usdc.balanceOf(whitelistedUser.address);
+      const finalFeeToBalance = await usdc.balanceOf(feeTo.address);
+
+      expect(finalUserUsdcBalance).to.be.gt(initialUserUsdcBalance);
+      expect(finalFeeToBalance).to.be.gt(initialFeeToBalance); // Fees should be collected
+
+      // Check that USDO was burned
+      expect(await usdo.balanceOf(whitelistedUser.address)).to.equal(0);
+    });
+
+    it('should use instant redeem fee rate for instant redeem', async function () {
+      const instantRedeemFeeRate = 50; // 0.5%
+      const redeemFeeRate = 20; // 0.2%
+
+      await usdoExpress.connect(maintainer).updateInstantRedeemFee(instantRedeemFeeRate);
+      await usdoExpress.connect(maintainer).updateRedeemFee(redeemFeeRate);
+
+      // Mint USDO for the user
+      await usdo.mint(whitelistedUser.address, redeemAmount);
+
+      // Add USDC to the contract for redemption
+      const usdcNeeded = await usdoExpress.convertToUnderlying(usdc.address, redeemAmount);
+      await usdc.transfer(usdoExpress.address, usdcNeeded);
+
+      // Calculate expected fee using instant redeem rate
+      const expectedFee = usdcNeeded.mul(instantRedeemFeeRate).div(1e4);
+
+      const initialFeeToBalance = await usdc.balanceOf(feeTo.address);
+
+      await usdoExpress.connect(whitelistedUser).instantRedeemSelf(whitelistedUser.address, redeemAmount);
+
+      const finalFeeToBalance = await usdc.balanceOf(feeTo.address);
+      const feeCollected = finalFeeToBalance.sub(initialFeeToBalance);
+
+      // Verify the instant redeem fee rate was used, not the regular redeem fee rate
+      expect(feeCollected).to.equal(expectedFee);
+
+      // Verify it's different from what the regular redeem fee would have been
+      const regularRedeemFee = usdcNeeded.mul(redeemFeeRate).div(1e4);
+      expect(feeCollected).to.not.equal(regularRedeemFee);
     });
 
     it('should allow redeeming for whitelisted user', async function () {
