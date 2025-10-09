@@ -354,7 +354,7 @@ contract USDOExpressV2 is UUPSUpgradeable, AccessControlUpgradeable, USDOExpress
         uint256 usdcNeeded = convertToUnderlying(_usdc, amt);
 
         // 3. redeem through the redemption contract (handles fees and rounding internally)
-        (uint256 payout, uint256 usycFee, int256 price) = _redemptionContract.redeem(usdcNeeded);
+        (uint256 payout, uint256 usycFee, int256 price) = _redemptionContract.redeemFor(from, usdcNeeded);
 
         // 4. calculate fees
         uint256 feeInUsdc = txsFee(usdcNeeded, TxType.INSTANT_REDEEM);

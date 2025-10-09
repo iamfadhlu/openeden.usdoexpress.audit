@@ -9,13 +9,13 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/math/MathUpgradeable.sol";
 import "../../interfaces/IRedemption.sol";
 import "../../interfaces/IPriceFeed.sol";
+import "./LiquidityController.sol";
 
-error UnauthorizedCaller();
-error ZeroAddress();
 error StalePrice(uint256 updatedAt, uint256 maxAge);
 error InvalidPrice(int256 price);
 error InsufficientUSDCReceived(uint256 received, uint256 required);
 error ExcessiveSellFee(uint256 feeRate);
+error LiquidityControllerNotSet();
 
 interface IUsycHelper {
     /**
@@ -73,8 +73,8 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
     address public helper;
     address public caller;
     address public usycTreasury;
-    uint256 public RESERVE1;
-    address public RESERVE2;
+    address public liquidityController;
+    uint256 public RESERVE2;
     uint256 public maxSellFeeRate;
 
     uint256 public constant FEE_MULTIPLIER = 10 ** 18;
@@ -92,20 +92,16 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
      * @param _helper USYC helper contract address
      * @param _caller Authorized caller address
      * @param _usycTreasury USYC treasury address
+     * @param _liquidityController LiquidityController contract address (optional)
      */
     function initialize(
         address _usyc,
         address _usdc,
         address _helper,
         address _caller,
-        address _usycTreasury
+        address _usycTreasury,
+        address _liquidityController
     ) public initializer {
-        if (_usyc == address(0)) revert ZeroAddress();
-        if (_usdc == address(0)) revert ZeroAddress();
-        if (_helper == address(0)) revert ZeroAddress();
-        if (_caller == address(0)) revert ZeroAddress();
-        if (_usycTreasury == address(0)) revert ZeroAddress();
-
         __Ownable_init();
         __UUPSUpgradeable_init();
 
@@ -114,6 +110,7 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
         helper = _helper;
         caller = _caller;
         usycTreasury = _usycTreasury;
+        liquidityController = _liquidityController;
 
         // Get decimals from both tokens
         usycDecimals = IERC20MetadataUpgradeable(_usyc).decimals();
@@ -132,6 +129,14 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
     }
 
     /**
+     * @notice Set liquidity controller contract (only owner)
+     * @param _liquidityController LiquidityController contract address
+     */
+    function setLiquidityController(address _liquidityController) external onlyOwner {
+        liquidityController = _liquidityController;
+    }
+
+    /**
      * @notice Redeem USYC tokens for USDC using USYC's sell function
      * @param _amount Amount of USDC desired to receive
      * @return payout usdc amount
@@ -139,19 +144,37 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
      * @return price used in conversion
      */
     function redeem(uint256 _amount) external override returns (uint256 payout, uint256 fee, int256 price) {
+        return _redeem(address(0), _amount);
+    }
+
+    function redeemFor(
+        address user,
+        uint256 _amount
+    ) external override returns (uint256 payout, uint256 fee, int256 price) {
+        return _redeem(user, _amount);
+    }
+
+    function _redeem(address user, uint256 _amount) internal returns (uint256 payout, uint256 fee, int256 price) {
         if (msg.sender != caller) revert UnauthorizedCaller();
+        if (liquidityController == address(0)) revert LiquidityControllerNotSet();
 
         uint256 sellFeeRate = IUsycHelper(helper).sellFee();
         if (sellFeeRate > maxSellFeeRate) revert ExcessiveSellFee(sellFeeRate);
 
         uint256 usycAmount = convertUsdcToToken(_amount);
 
+        // Reserve liquidity if user-specific quota is being used
+        if (user != address(0)) {
+            // This will revert if user doesn't have sufficient quota
+            LiquidityController(liquidityController).reserveLiquidity(user, usycAmount);
+        }
+
         SafeERC20Upgradeable.safeTransferFrom(IERC20Upgradeable(usyc), usycTreasury, address(this), usycAmount);
         SafeERC20Upgradeable.safeIncreaseAllowance(IERC20Upgradeable(usyc), helper, usycAmount);
 
-        IUsycHelper(helper).sellFor(usycAmount, address(caller));
+        payout = IUsycHelper(helper).sellFor(usycAmount, address(caller));
 
-        (payout, fee, price) = IUsycHelper(helper).sellPreview(usycAmount);
+        (, fee, price) = IUsycHelper(helper).sellPreview(usycAmount);
     }
 
     /**
@@ -161,7 +184,7 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
      * @return tBalance The redemption token balance in the Treasury.
      * @return tAllowanceInUsdc The redemption token allowance in USDC.
      * @return tBalanceInUsdc The redemption token balance in USDC.
-     * @return minimum The minimum of the available liquidity, the redemption token allowance, and the redemption token balance in USDC.
+     * @return minimumInUsdc The minimum of liquidity, tAllowanceInUsdc, and tBalanceInUsdc.
      */
     function checkLiquidity()
         public
@@ -173,7 +196,7 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
             uint256 tBalance,
             uint256 tAllowanceInUsdc,
             uint256 tBalanceInUsdc,
-            uint256 minimum
+            uint256 minimumInUsdc
         )
     {
         liquidity = IERC20Upgradeable(usdc).balanceOf(helper);
@@ -184,7 +207,35 @@ contract UsycRedemption is IRedemption, OwnableUpgradeable, UUPSUpgradeable {
         tBalance = IERC20Upgradeable(usyc).balanceOf(usycTreasury);
         tBalanceInUsdc = convertTokenToUsdc(tBalance);
 
-        minimum = liquidity.min(tAllowanceInUsdc.min(tBalanceInUsdc));
+        minimumInUsdc = liquidity.min(tAllowanceInUsdc.min(tBalanceInUsdc));
+    }
+
+    /**
+     * @notice Check liquidity available for a specific user
+     * @param user User address to check
+     * @return userUsdcLiquidity Available liquidity for this user in USDC
+     * @return totalUsdcLiquidity Total available liquidity in USDC
+     * @return userUsycQuota User's available quota in USYC
+     */
+    function checkUserLiquidity(
+        address user
+    ) external view returns (uint256 userUsdcLiquidity, uint256 totalUsdcLiquidity, uint256 userUsycQuota) {
+        // Get base liquidity
+        (, , , , , uint256 baseLiquidity) = checkLiquidity();
+        totalUsdcLiquidity = baseLiquidity;
+
+        if (liquidityController == address(0)) {
+            userUsdcLiquidity = 0;
+            userUsycQuota = 0;
+        } else {
+            // Get user-specific available quota (total quota - used)
+            (uint256 availableQuota, , ) = LiquidityController(liquidityController).checkUserLiquidity(user);
+            userUsycQuota = availableQuota;
+
+            // User liquidity is minimum of available quota and total liquidity
+            uint256 quotaInUsdc = convertTokenToUsdc(availableQuota);
+            userUsdcLiquidity = totalUsdcLiquidity.min(quotaInUsdc);
+        }
     }
 
     /**

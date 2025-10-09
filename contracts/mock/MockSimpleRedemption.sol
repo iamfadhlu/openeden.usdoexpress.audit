@@ -20,6 +20,18 @@ contract MockSimpleRedemption is IRedemption {
         asset = _asset;
     }
 
+    function redeemFor(
+        address /* user */,
+        uint256 amount
+    ) external override returns (uint256 payout, uint256 fee, int256 price) {
+        payout = amount;
+        fee = 0;
+        price = 1e8; // 1:1 ratio with 8 decimals (like Chainlink price feeds)
+        // Transfer to the calling contract (USDOExpressV2), not to the end user
+        // The calling contract will handle distribution to the user
+        IERC20(asset).transfer(msg.sender, amount);
+    }
+
     /**
      * @notice Redeem USDC - simply returns the requested amount
      * @dev In a real implementation, this would handle the redemption logic
